@@ -1,0 +1,237 @@
+def PIPELINE_ID = "${env.BUILD_NUMBER}"
+
+def getImageTag() {
+    def dateFormat = new java.text.SimpleDateFormat('yyyyMMddHHmmss')
+    def currentDate = new Date()
+    return dateFormat.format(currentDate)
+}
+
+podTemplate(
+    label: "${PIPELINE_ID}",
+    serviceAccount: 'jenkins',
+    containers: [
+        containerTemplate(name: 'podman', image: "mgoltzsche/podman", ttyEnabled: true, command: 'cat', privileged: true),
+        containerTemplate(name: 'gradle',
+                        image: 'gradle:jdk17',
+                        ttyEnabled: true,
+                        command: 'cat',
+                        envVars: [
+                            envVar(key: 'DOCKER_HOST', value: 'unix:///run/podman/podman.sock'),
+                            envVar(key: 'TESTCONTAINERS_DOCKER_SOCKET_OVERRIDE', value: '/run/podman/podman.sock'),
+                            envVar(key: 'TESTCONTAINERS_RYUK_DISABLED', value: 'true')
+                        ]),
+        containerTemplate(name: 'azure-cli', image: 'hiondal/azure-kubectl:latest', command: 'cat', ttyEnabled: true),
+        containerTemplate(name: 'envsubst', image: "hiondal/envsubst", command: 'sleep', args: '1h'),
+        containerTemplate(name: 'git', image: 'alpine/git:latest', command: 'cat', ttyEnabled: true)
+    ],
+    volumes: [
+        emptyDirVolume(mountPath: '/home/gradle/.gradle', memory: false),
+        emptyDirVolume(mountPath: '/root/.azure', memory: false),
+        emptyDirVolume(mountPath: '/run/podman', memory: false)
+    ]
+) {
+    node(PIPELINE_ID) {
+        def props
+        def imageTag = getImageTag()
+        def namespace
+        def services = ['member', 'mysub', 'recommend']
+        def manifestRepo = 'https://github.com/chadol75-dg0303/lifesub-manifest.git'
+        def manifestRepoDir = 'lifesub-manifest'
+
+        stage("Get Source") {
+            checkout scm
+            props = readProperties file: "deployment/deploy_env_vars"
+            namespace = "${props.namespace}"
+        }
+
+        stage("Setup AKS") {
+            container('azure-cli') {
+                withCredentials([azureServicePrincipal('azure-credentials')]) {
+                    sh """
+                        az login --service-principal -u \$AZURE_CLIENT_ID -p \$AZURE_CLIENT_SECRET -t \$AZURE_TENANT_ID
+                        az aks get-credentials --resource-group rg-digitalgarage-01 --name aks-digitalgarage-01 --overwrite-existing
+                        kubectl create namespace ${namespace} --dry-run=client -o yaml | kubectl apply -f -
+                    """
+                }
+            }
+        }
+
+        stage('Build Applications & SonarQube Analysis') {
+            container('podman') {
+                sh 'podman system service -t 0 unix:///run/podman/podman.sock & sleep 2'
+            }
+
+            container('gradle') {
+                def testContainersConfig = '''docker.client.strategy=org.testcontainers.dockerclient.UnixSocketClientProviderStrategy
+docker.host=unix:///run/podman/podman.sock
+ryuk.container.privileged=true
+testcontainers.reuse.enable=true'''
+
+                sh """
+                    # TestContainers 설정
+                    mkdir -p member/src/test/resources mysub-infra/src/test/resources recommend/src/test/resources
+                    echo '${testContainersConfig}' > member/src/test/resources/testcontainers.properties
+                    echo '${testContainersConfig}' > mysub-infra/src/test/resources/testcontainers.properties
+                    echo '${testContainersConfig}' > recommend/src/test/resources/testcontainers.properties
+                """
+
+                // SonarQube 분석
+                withSonarQubeEnv('SonarQube') {
+                    sh """
+                        chmod +x gradlew
+
+                        # 빌드 실행
+                        ./gradlew :member:build :mysub-infra:build :recommend:build -x test
+
+                        # Member 서비스 테스트 및 SonarQube 분석
+                        ./gradlew :member:test :member:jacocoTestReport :member:sonar \
+                            -Dsonar.projectKey=lifesub-member-dg0303 \
+                            -Dsonar.projectName=lifesub-member-dg0303 \
+                            -Dsonar.java.binaries=build/classes/java/main \
+                            -Dsonar.coverage.jacoco.xmlReportPaths=build/reports/jacoco/test/jacocoTestReport.xml \
+                            -Dsonar.exclusions=**/config/**,**/entity/**,**/dto/**,**/*Application.class,**/exception/**
+
+                        # Recommend 서비스 테스트 및 SonarQube 분석
+                        ./gradlew :recommend:test :recommend:jacocoTestReport :recommend:sonar \
+                            -Dsonar.projectKey=lifesub-recommend-dg0303 \
+                            -Dsonar.projectName=lifesub-recommend-dg0303 \
+                            -Dsonar.java.binaries=build/classes/java/main \
+                            -Dsonar.coverage.jacoco.xmlReportPaths=build/reports/jacoco/test/jacocoTestReport.xml \
+                            -Dsonar.exclusions=**/config/**,**/entity/**,**/dto/**,**/*Application.class,**/exception/**
+
+                        # Mysub 서비스 테스트 및 SonarQube 분석
+                        ./gradlew :mysub-infra:test :mysub-infra:jacocoTestReport :mysub-infra:sonar \
+                            -Dsonar.projectKey=lifesub-mysub-dg0303 \
+                            -Dsonar.projectName=lifesub-mysub-dg0303 \
+                            -Dsonar.java.binaries=build/classes/java/main \
+                            -Dsonar.coverage.jacoco.xmlReportPaths=build/reports/jacoco/test/jacocoTestReport.xml \
+                            -Dsonar.exclusions=**/config/**,**/entity/**,**/dto/**,**/*Application.class,**/exception/**
+                    """
+                }
+            }
+        }
+
+        stage('Quality Gate') {
+            timeout(time: 10, unit: 'MINUTES') {
+                def qg = waitForQualityGate()
+                if (qg.status != 'OK') {
+                    error "Pipeline aborted due to quality gate failure: ${qg.status}"
+                }
+            }
+        }
+
+        stage('Build & Push Images') {
+            container('podman') {
+                withCredentials([usernamePassword(
+                    credentialsId: 'acr-credentials',
+                    usernameVariable: 'USERNAME',
+                    passwordVariable: 'PASSWORD'
+                )]) {
+                    sh "podman login ${props.registry} --username \$USERNAME --password \$PASSWORD"
+
+                    services.each { service ->
+                        def buildDir = service == 'mysub' ? 'mysub-infra' : service
+                        def jarFile = service == 'mysub' ? 'mysub.jar' : "${service}.jar"
+
+                        sh """
+                            podman build \
+                                --build-arg BUILD_LIB_DIR="${buildDir}/build/libs" \
+                                --build-arg ARTIFACTORY_FILE="${jarFile}" \
+                                -f deployment/container/Dockerfile \
+                                -t ${props.registry}/${props.image_org}/${service}:${imageTag} .
+
+                            podman push ${props.registry}/${props.image_org}/${service}:${imageTag}
+                        """
+                    }
+                }
+            }
+        }
+
+        stage('Clone Manifest Repository') {
+            container('git') {
+                withCredentials([usernamePassword(
+                    credentialsId: 'github-credentials-dg0303',
+                    usernameVariable: 'GIT_USERNAME',
+                    passwordVariable: 'GIT_PASSWORD'
+                )]) {
+                    // Set git configs for the container
+                    sh """
+                        git config --global user.email "jenkins@example.com"
+                        git config --global user.name "Jenkins CI"
+
+                        # Clone the manifest repository
+                        git clone https://${GIT_USERNAME}:${GIT_PASSWORD}@github.com/chadol75-dg0303/lifesub-manifest.git
+                    """
+                }
+            }
+        }
+
+        stage('Update Deployment Manifests') {
+            container('git') {
+                services.each { service ->
+                    // Update the image tag in the deployment manifest
+                    sh """
+                        cd lifesub-manifest
+
+                        # Ensure deployments directory exists
+                        mkdir -p lifesub/deployments
+
+                        # Check if deployment file exists
+                        if [ -f lifesub/deployments/${service}-deployment.yaml ]; then
+                            # Update existing deployment file with new image tag
+                            sed -i 's|image: ${props.registry}/${props.image_org}/${service}:.*|image: ${props.registry}/${props.image_org}/${service}:${imageTag}|g' lifesub/deployments/${service}-deployment.yaml
+                            echo "Updated ${service} deployment with new image tag: ${imageTag}"
+                        else
+                            # Create new deployment file if it doesn't exist
+                            echo "Creating new deployment file for ${service}"
+                            # Extract deployment section from the template
+                            grep -A 200 "kind: Deployment" deployment/deploy.yaml.template | grep -B 200 "---" > temp-deployment.yaml
+
+                            # Replace variables in the deployment template
+                            export namespace=${namespace}
+                            export teamid=${props.teamid}
+                            export allowed_origins=${props.allowed_origins}
+                            export jwt_secret_key=${props.jwt_secret_key}
+                            export postgres_user=${props.postgres_user}
+                            export postgres_password=${props.postgres_password}
+                            export replicas=${props.replicas}
+                            export resources_requests_cpu=${props.resources_requests_cpu}
+                            export resources_requests_memory=${props.resources_requests_memory}
+                            export resources_limits_cpu=${props.resources_limits_cpu}
+                            export resources_limits_memory=${props.resources_limits_memory}
+                            export ${service}_image_path=${props.registry}/${props.image_org}/${service}:${imageTag}
+
+                            envsubst < temp-deployment.yaml > lifesub/deployments/${service}-deployment.yaml
+                            rm temp-deployment.yaml
+                        fi
+                    """
+                }
+            }
+        }
+
+        stage('Commit and Push Manifest Changes') {
+            container('git') {
+                withCredentials([usernamePassword(
+                    credentialsId: 'github-credentials-dg0303',
+                    usernameVariable: 'GIT_USERNAME',
+                    passwordVariable: 'GIT_PASSWORD'
+                )]) {
+                    sh """
+                        cd lifesub-manifest
+
+                        # Add all changes
+                        git add lifesub/deployments/*.yaml
+
+                        # Commit changes with meaningful message
+                        git commit -m "Update deployment images to tag ${imageTag} [ci skip]" || echo "No changes to commit"
+
+                        # Push changes back to repository
+                        git push https://${GIT_USERNAME}:${GIT_PASSWORD}@github.com/chadol75-dg0303/lifesub-manifest.git
+                    """
+                }
+
+                echo "Deployment manifests updated successfully. ArgoCD will detect the changes and sync automatically."
+            }
+        }
+    }
+}
